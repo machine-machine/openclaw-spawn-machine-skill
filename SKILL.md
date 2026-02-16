@@ -32,14 +32,49 @@ user decisions and auto-execute infrastructure commands where safe.
 - Steps that define identity, choose services, confirm deployment → ask user via Telegram buttons
 - When in strong doubt → ask with buttons, include your recommendation
 
+## Pre-Flight Gate (MANDATORY)
+
+**Do NOT deploy without ALL of these. Read `known-issues.md` first.**
+
+Before creating ANY Coolify app, confirm with the operator:
+1. ✅ Telegram bot token (from @BotFather) — ask FIRST, not after deploy
+2. ✅ LLM API key (Anthropic/OpenAI/other) — must exist before deploy
+3. ✅ Agent branch pushed to GitHub with identity files
+4. ✅ AGENT_CONFIG_GENERATE=true in env vars
+
+After setting Coolify env vars:
+5. ✅ Delete ALL `is_preview=true` duplicate env vars (Coolify bug)
+6. ✅ Verify env vars by listing them back
+
+Without these, you get a container that's "running:unhealthy" with no way to fix it
+except redeploying. Don't deploy warm bodies.
+
 ## Infrastructure Context
 
-- Base image: `agent-desktop:latest` (pre-built on Coolify host)
-- Network: Coolify external network for cross-service DNS
-- Shared: Qdrant (memory), BGE-M3 (embeddings), Speaches (STT), Qwen3-TTS (TTS)
-- Access: Guacamole Full at g2.machinemachine.ai
-- Incubator: `platform/incubator/{agent-name}/`
-- CLI: `~/.openclaw/skills/spawn-machine/spawn-machine.sh`
+- **Source repo**: `machine-machine/m2-desktop` (private, GitHub App auth required)
+- **Base branch**: `guacamole` — the canonical desktop image + compose
+- **Per-agent branch**: Each new agent gets its own branch forked from `guacamole`
+  - Branch name = agent name (e.g. `pittbull`, `peter`)
+  - Identity files live in `incubator/{agent-name}/` on that branch
+  - Coolify app points to the agent's branch
+  - This isolates agent config changes and allows per-agent Dockerfile tweaks
+- **GitHub App UUID**: `r00ooc0kw0csgsww0k8kso00` (machine-machine org)
+- **Coolify API**: Use `/applications/private-github-app` to create git-backed apps
+- **Network**: Coolify external network for cross-service DNS
+- **Shared services**: Qdrant (memory), BGE-M3 (embeddings), Speaches (STT), Qwen3-TTS (TTS)
+- **Guacamole**: Running on m2's desktop stack at g2.machinemachine.ai — register new agents as VNC connections there (no separate Guacamole per agent)
+- **Incubator (local)**: `platform/incubator/{agent-name}/` — working copy for identity files before pushing to branch
+- **CLI**: `~/.openclaw/skills/spawn-machine/spawn-machine.sh`
+
+## Branch Workflow (per agent)
+
+1. `cd platform/m2-desktop && git checkout guacamole`
+2. `git checkout -b {agent-name}` — fork from guacamole
+3. Create/update identity files in `incubator/{agent-name}/`
+4. `git push origin {agent-name}`
+5. Create Coolify app via API pointing to branch `{agent-name}`
+6. Set env vars including `AGENT_BOOTSTRAP_REPO_URL` pointing to that branch
+7. **Never commit agent-specific files to `guacamole`** — keep it clean as the base
 
 ## Data Files (load on-demand)
 
@@ -271,30 +306,56 @@ message({
 
 Execute deployment on Coolify.
 
-1. Pre-flight checks (AUTO):
-   - Verify `agent-desktop:latest` image exists
-   - Verify identity files committed to GitHub
+1. **Create agent branch** (AUTO):
+   ```bash
+   cd platform/m2-desktop
+   git checkout guacamole && git pull
+   git checkout -b {name}
+   # Identity files should already be in incubator/{name}/
+   git push origin {name}
+   ```
+
+2. Pre-flight checks (AUTO):
+   - Verify agent branch pushed to GitHub
+   - Verify identity files exist on branch (`incubator/{name}/SOUL.md` etc.)
    - Verify Coolify API accessible
    - Load `data/known-issues.md` for deployment pitfalls
 
-2. Confirm deployment:
-```
-message({
-  message: "🚀 **Pre-flight checks passed.**\n\n✅ Image ready\n✅ Identity files on GitHub\n✅ Coolify accessible\n\nDeploy {name} now?",
-  buttons: [
-    [
-      { text: "🚀 Deploy!", callback_data: "spawn_deploy_confirm" },
-      { text: "⏸️ Wait", callback_data: "spawn_deploy_wait" }
-    ]
-  ]
-})
-```
+3. **Create Coolify app via API** (AUTO):
+   ```python
+   # MUST use /applications/private-github-app for private repos
+   payload = {
+       'project_uuid': '<target-project>',
+       'environment_name': 'production',
+       'server_uuid': 'vw8k84s4swgoc4w0sswkgwc4',
+       'destination_uuid': 'a8owgg0kw880wwk08o484cog',
+       'name': '{name}-desktop',
+       'description': '{name} AI Agent - {purpose}',
+       'git_repository': 'machine-machine/m2-desktop',
+       'git_branch': '{name}',  # agent's own branch!
+       'build_pack': 'dockercompose',
+       'docker_compose_location': '/docker-compose.agent.yml',
+       'github_app_uuid': 'r00ooc0kw0csgsww0k8kso00',
+       'ports_exposes': '4822',
+       'instant_deploy': False
+   }
+   POST /api/v1/applications/private-github-app
+   ```
 
-3. Execute deployment and monitor:
-   - Create Coolify application via API (or instruct user if API unavailable)
-   - Set environment variables
-   - Trigger deployment
-   - Monitor container health (poll every 10s, report progress)
+4. **Set env vars** (AUTO):
+   - PATCH existing vars (from compose defaults): `AGENT_NAME`, `VNC_PASSWORD`, etc.
+   - POST new vars: `AGENT_CPUS`, `AGENT_MEMORY`
+   - Set `AGENT_BOOTSTRAP_REPO_URL` to: `https://raw.githubusercontent.com/machine-machine/m2-desktop/{name}/incubator/{name}`
+   - **Important**: Use PATCH for vars that exist from compose, POST for new ones
+
+5. **Trigger deployment** (AUTO):
+   ```
+   POST /api/v1/applications/{uuid}/restart
+   ```
+   - This builds from source (Dockerfile on the agent's branch)
+   - Build takes 5-10 minutes for full image
+   - Poll deployment status via: `GET /api/v1/deployments/{deployment_uuid}`
+   - Monitor container health (poll every 30s, report progress)
    - Send progress updates:
 
 ```
@@ -319,11 +380,12 @@ message({
 
 ### Step 6: Register & Network (AUTO)
 
-Fully automated — report results only.
+Fully automated — report results only. Guacamole runs on m2's desktop stack (g2.machinemachine.ai). No separate Guacamole per agent.
 
-1. DNS verification: `ping -c 2 {name}-desktop`
+1. DNS verification: `ping -c 2 {name}-desktop` (Coolify network alias)
 2. Port checks: VNC (5900), guacd (4822)
-3. Guacamole registration: `spawn-machine.sh register {name}`
+3. Guacamole registration: Add VNC connection in m2's Guacamole DB pointing to `{name}-desktop:5900`
+   - Use `spawn-machine.sh register {name}` or register via Guacamole API/DB
 
 ```
 message({
