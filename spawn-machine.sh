@@ -340,12 +340,253 @@ cmd_list() {
 }
 
 # =============================================================================
+# Coolify helpers
+# =============================================================================
+COOLIFY_API="${COOLIFY_API_URL:-https://cool.machinemachine.ai/api/v1}"
+COOLIFY_AUTH_TOKEN=""
+
+coolify_token() {
+    if [ -f "${HOME}/.config/coolify/config" ]; then
+        source "${HOME}/.config/coolify/config"
+        COOLIFY_AUTH_TOKEN="${COOLIFY_TOKEN:-}"
+    fi
+    echo "${COOLIFY_AUTH_TOKEN}"
+}
+
+coolify_api() {
+    local method="$1" endpoint="$2" data="${3:-}"
+    local token; token=$(coolify_token)
+    if [ -n "${data}" ]; then
+        curl -sf -X "${method}" "${COOLIFY_API}/${endpoint}" \
+            -H "Authorization: Bearer ${token}" \
+            -H "Content-Type: application/json" \
+            -d "${data}"
+    else
+        curl -sf -X "${method}" "${COOLIFY_API}/${endpoint}" \
+            -H "Authorization: Bearer ${token}"
+    fi
+}
+
+coolify_set_env() {
+    local uuid="$1" key="$2" value="$3"
+    coolify_api POST "applications/${uuid}/envs" \
+        "{\"key\":\"${key}\",\"value\":$(echo -n "${value}" | python3 -c 'import json,sys; print(json.dumps(sys.stdin.read()))'),\"is_preview\":false}" \
+        > /dev/null 2>&1
+}
+
+# =============================================================================
+# cmd_spawn — single command to spawn a new agent
+# Usage: spawn-machine.sh spawn <name> <telegram_token> [options]
+# Options:
+#   --anthropic-key KEY    Per-agent Anthropic API key
+#   --openrouter-key KEY   Per-agent OpenRouter API key
+#   --cerebras-key KEY     Per-agent Cerebras API key
+#   --skills LIST          Override default AGENT_SKILLS
+#   --no-deploy            Create + configure but don't deploy yet
+# =============================================================================
+COOLIFY_PROJECT_UUID="q8w4cwskgwkgg0cg00k00coo"
+COOLIFY_SERVER_UUID="vw8k84s4swgoc4w0sswkgwc4"
+COOLIFY_GITHUB_APP_UUID="r00ooc0kw0csgsww0k8kso00"
+FLEET_ENV_CONF="${HOME}/.config/spawn-machine/fleet-env.conf"
+
+cmd_spawn() {
+    local name="${1:-}"
+    local telegram_token="${2:-}"
+    shift 2 || true
+
+    # Parse options
+    local anthropic_key="" openrouter_key="" cerebras_key="" custom_skills="" no_deploy=false
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --anthropic-key)  anthropic_key="$2";  shift 2 ;;
+            --openrouter-key) openrouter_key="$2"; shift 2 ;;
+            --cerebras-key)   cerebras_key="$2";   shift 2 ;;
+            --skills)         custom_skills="$2";  shift 2 ;;
+            --no-deploy)      no_deploy=true;      shift ;;
+            *) err "Unknown option: $1"; exit 1 ;;
+        esac
+    done
+
+    [ -z "${name}" ]           && { err "Usage: spawn-machine.sh spawn <name> <telegram_token>"; exit 1; }
+    [ -z "${telegram_token}" ] && { err "Telegram token required"; exit 1; }
+
+    # Validate name not already in registry
+    if grep -q "^  ${name}:" "${REGISTRY_FILE}" 2>/dev/null; then
+        err "Agent '${name}' already exists in registry. Use a different name."
+        exit 1
+    fi
+
+    log "Spawning agent '${name}'..."
+
+    # Load fleet env defaults
+    local fleet_env=()
+    if [ -f "${FLEET_ENV_CONF}" ]; then
+        while IFS='=' read -r k v; do
+            [[ "$k" =~ ^#.*$ || -z "$k" ]] && continue
+            fleet_env+=("$k=$v")
+        done < "${FLEET_ENV_CONF}"
+        log "Fleet env loaded from ${FLEET_ENV_CONF} (${#fleet_env[@]} vars)"
+    else
+        log "Warning: No fleet env config at ${FLEET_ENV_CONF} — set shared vars manually in Coolify"
+    fi
+
+    # -------------------------------------------------------------------------
+    # Step 1: Create Coolify app
+    # -------------------------------------------------------------------------
+    log "[1/6] Creating Coolify application '${name}-desktop'..."
+    local app_json
+    app_json=$(coolify_api POST "applications/private-github-app" "{
+        \"project_uuid\": \"${COOLIFY_PROJECT_UUID}\",
+        \"server_uuid\": \"${COOLIFY_SERVER_UUID}\",
+        \"environment_name\": \"production\",
+        \"git_repository\": \"machine-machine/m2-desktop\",
+        \"git_branch\": \"base\",
+        \"build_pack\": \"dockercompose\",
+        \"docker_compose_location\": \"/docker-compose.agent.yml\",
+        \"github_app_uuid\": \"${COOLIFY_GITHUB_APP_UUID}\",
+        \"ports_exposes\": \"8080\",
+        \"name\": \"${name}-desktop\",
+        \"instant_deploy\": false
+    }") || { err "Failed to create Coolify app"; exit 1; }
+
+    local app_uuid
+    app_uuid=$(echo "${app_json}" | python3 -c "import json,sys; print(json.load(sys.stdin)['uuid'])")
+    log "  Created: ${app_uuid}"
+
+    # -------------------------------------------------------------------------
+    # Step 2: Set pre_deployment_command (creates host bind mount dir)
+    # -------------------------------------------------------------------------
+    log "[2/6] Setting host bind mount + compose location..."
+    coolify_api PATCH "applications/${app_uuid}" "{
+        \"docker_compose_location\": \"/docker-compose.agent.yml\",
+        \"pre_deployment_command\": \"mkdir -p /opt/m2o/${name}/home && chown -R 1000:1000 /opt/m2o/${name}/home\"
+    }" > /dev/null
+
+    # -------------------------------------------------------------------------
+    # Step 3: Set environment variables
+    # -------------------------------------------------------------------------
+    log "[3/6] Setting environment variables..."
+
+    # Fleet-wide vars (from config file)
+    for kv in "${fleet_env[@]}"; do
+        local k="${kv%%=*}" v="${kv#*=}"
+        coolify_set_env "${app_uuid}" "${k}" "${v}"
+    done
+
+    # Agent-specific vars (always set, override fleet defaults)
+    coolify_set_env "${app_uuid}" "AGENT_NAME"               "${name}"
+    coolify_set_env "${app_uuid}" "M2_HOME"                  "/agent_home"
+    coolify_set_env "${app_uuid}" "AGENT_TELEGRAM_BOT_TOKEN" "${telegram_token}"
+    coolify_set_env "${app_uuid}" "COLLECTION_NAME"          "agent_memory_${name}"
+
+    [ -n "${anthropic_key}" ]  && coolify_set_env "${app_uuid}" "ANTHROPIC_API_KEY"   "${anthropic_key}"
+    [ -n "${openrouter_key}" ] && coolify_set_env "${app_uuid}" "OPENROUTER_API_KEY"  "${openrouter_key}"
+    [ -n "${cerebras_key}" ]   && coolify_set_env "${app_uuid}" "CEREBRAS_API_KEY"    "${cerebras_key}"
+    [ -n "${custom_skills}" ]  && coolify_set_env "${app_uuid}" "AGENT_SKILLS"        "${custom_skills}"
+
+    log "  Env vars set"
+
+    # -------------------------------------------------------------------------
+    # Step 4: Pre-register Guacamole connection
+    # -------------------------------------------------------------------------
+    log "[4/6] Pre-registering Guacamole connection..."
+    load_guacamole_creds 2>/dev/null && {
+        local guac_token
+        guac_token=$(guacamole_token 2>/dev/null) && {
+            local vnc_pass="agentdesktop"
+            local response
+            response=$(curl -sf -X POST \
+                "${GUACAMOLE_URL}/api/session/data/mysql/connections?token=${guac_token}" \
+                -H "Content-Type: application/json" \
+                -d "{
+                    \"name\": \"${name^} Desktop\",
+                    \"protocol\": \"vnc\",
+                    \"parentIdentifier\": \"ROOT\",
+                    \"parameters\": {
+                        \"hostname\": \"${name}-desktop\",
+                        \"port\": \"5900\",
+                        \"password\": \"${vnc_pass}\",
+                        \"color-depth\": \"32\",
+                        \"width\": \"1920\",
+                        \"height\": \"1080\"
+                    },
+                    \"attributes\": {}
+                }")
+            local conn_id
+            conn_id=$(echo "${response}" | python3 -c "import json,sys; print(json.load(sys.stdin).get('identifier',''))" 2>/dev/null || true)
+            [ -n "${conn_id}" ] && log "  Guacamole connection ID: ${conn_id}" || log "  Warning: Guacamole pre-registration failed (agent will register on first boot)"
+        }
+    } || log "  Guacamole creds not found — skipping pre-registration"
+
+    # -------------------------------------------------------------------------
+    # Step 5: Update registry
+    # -------------------------------------------------------------------------
+    log "[5/6] Registering in fleet registry..."
+    local ts
+    ts=$(date -u +%Y-%m-%d)
+    cat >> "${REGISTRY_FILE}" << YAML
+
+  ${name}:
+    coolify_uuid: ${app_uuid}
+    telegram: pending
+    memory_collection: agent_memory_${name}
+    status: provisioning
+    created: ${ts}
+    host_path: /opt/m2o/${name}/home
+YAML
+    log "  Added to registry.yaml"
+
+    # -------------------------------------------------------------------------
+    # Step 6: Deploy (unless --no-deploy)
+    # -------------------------------------------------------------------------
+    if [ "${no_deploy}" = "false" ]; then
+        log "[6/6] Triggering deployment..."
+        coolify_api POST "deploy?uuid=${app_uuid}&force=false" > /dev/null
+        log "  Deployment triggered"
+        log ""
+        log "✅ Agent '${name}' spawning!"
+        log "   Coolify UUID: ${app_uuid}"
+        log "   Host path:    /opt/m2o/${name}/home"
+        log "   Guacamole:    m2o.machinemachine.ai → '${name^} Desktop'"
+        log "   Timeline:     ~3 min to first Telegram message"
+    else
+        log "[6/6] Skipping deploy (--no-deploy). Run when ready:"
+        log "  coolify_api POST deploy?uuid=${app_uuid}&force=false"
+    fi
+
+    # Notify via escalation
+    python3 - << PYEOF 2>/dev/null || true
+import urllib.request, json, os
+token = "${BGE_PROXY_TOKEN:-}"
+if token:
+    payload = json.dumps({
+        "from_agent": "m2",
+        "to_agent": "m2",
+        "message": "spawn-machine: '${name}' spawning (uuid: ${app_uuid}). Notify master when live.",
+        "priority": "low"
+    }).encode()
+    req = urllib.request.Request(
+        "http://bge-proxy.machinemachine.ai/escalate",
+        data=payload,
+        headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+        method="POST"
+    )
+    urllib.request.urlopen(req, timeout=5)
+PYEOF
+}
+
+# =============================================================================
 # Main
 # =============================================================================
 COMMAND="${1:-help}"
 shift || true
 
 case "${COMMAND}" in
+    spawn)
+        require_agent_name "${1:-}"
+        [ -z "${2:-}" ] && { err "Usage: spawn <name> <telegram_token>"; exit 1; }
+        cmd_spawn "$@"
+        ;;
     init)
         require_agent_name "${1:-}"
         cmd_init "$1"
@@ -374,12 +615,20 @@ case "${COMMAND}" in
         echo "Usage: spawn-machine.sh <command> [agent-name]"
         echo ""
         echo "Commands:"
+        echo "  spawn <name> <token> [opts]  Spawn agent end-to-end (⭐ use this)"
+        echo "    --anthropic-key KEY         Per-agent Anthropic key"
+        echo "    --openrouter-key KEY        Per-agent OpenRouter key"
+        echo "    --cerebras-key KEY          Per-agent Cerebras key"
+        echo "    --skills LIST               Override default AGENT_SKILLS"
+        echo "    --no-deploy                 Configure but don't deploy yet"
         echo "  init <name>       Create incubator directory + agent spec"
         echo "  configure <name>  Generate env vars from agent spec"
         echo "  register <name>   Register agent in Guacamole"
         echo "  validate <name>   Run health checks on deployed agent"
         echo "  status [name]     Show status of one or all agents"
         echo "  list              List all agents in incubator"
+        echo ""
+        echo "Fleet env config: ${FLEET_ENV_CONF}"
         ;;
     *)
         err "Unknown command: ${COMMAND}"
