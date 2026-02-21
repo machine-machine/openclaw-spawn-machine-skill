@@ -588,15 +588,27 @@ PYEOF
     [ -n "${cerebras_key}" ]   && coolify_set_env "${app_uuid}" "CEREBRAS_API_KEY"    "${cerebras_key}"
     [ -n "${custom_skills}" ]  && coolify_set_env "${app_uuid}" "AGENT_SKILLS"        "${custom_skills}"
 
-    # S3/Minio env vars (inherit from environment or fleet-env.conf)
+    # S3/Minio env vars — read from shell env first, fall back to fleet-env.conf
     local minio_endpoint="${MINIO_ENDPOINT:-}"
     local minio_access="${MINIO_ACCESS_KEY:-}"
     local minio_secret="${MINIO_SECRET_KEY:-}"
+    local minio_bucket="${MINIO_BUCKET:-m2o-agents}"
+    for kv in "${fleet_env[@]}"; do
+        case "${kv%%=*}" in
+            MINIO_ENDPOINT)   [ -z "$minio_endpoint" ] && minio_endpoint="${kv#*=}" ;;
+            MINIO_ACCESS_KEY) [ -z "$minio_access"   ] && minio_access="${kv#*=}" ;;
+            MINIO_SECRET_KEY) [ -z "$minio_secret"   ] && minio_secret="${kv#*=}" ;;
+            MINIO_BUCKET)     minio_bucket="${kv#*=}" ;;
+        esac
+    done
     if [ -n "$minio_endpoint" ]; then
         coolify_set_env "${app_uuid}" "MINIO_ENDPOINT"    "${minio_endpoint}"
         coolify_set_env "${app_uuid}" "MINIO_ACCESS_KEY"  "${minio_access}"
         coolify_set_env "${app_uuid}" "MINIO_SECRET_KEY"  "${minio_secret}"
-        coolify_set_env "${app_uuid}" "MINIO_BUCKET"      "${MINIO_BUCKET:-m2o-agents}"
+        coolify_set_env "${app_uuid}" "MINIO_BUCKET"      "${minio_bucket}"
+        log "  S3 sync configured → ${minio_endpoint}/${minio_bucket}"
+    else
+        log "  Warning: MINIO_ENDPOINT not set — agent home will NOT be S3-backed"
     fi
 
     log "  Env vars set"
