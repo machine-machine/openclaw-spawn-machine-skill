@@ -437,7 +437,7 @@ cmd_spawn() {
     local compose_content
     compose_content="# Agent compose — ${name} — all values hardcoded, no \${VAR} outside environment section
 services:
-  agent-desktop-worker:
+  ${name}-desktop:
     container_name: ${name}-desktop
     image: ghcr.io/machine-machine/m2-desktop:agent-latest
     restart: unless-stopped
@@ -487,7 +487,7 @@ services:
       - /opt/m2o/${name}/home:/agent_home
 
     healthcheck:
-      test: [\"CMD-SHELL\", \"ss -tlnp | grep 4822 || exit 1\"]
+      test: [\"CMD-SHELL\", \"nc -z localhost 4822 || exit 1\"]
       interval: 30s
       timeout: 10s
       retries: 3
