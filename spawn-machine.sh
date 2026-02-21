@@ -433,7 +433,7 @@ cmd_spawn() {
     # -------------------------------------------------------------------------
     # Step 1: Create Coolify app
     # -------------------------------------------------------------------------
-    log "[1/6] Creating Coolify application '${name}-desktop'..."
+    log "[1/7] Creating Coolify application '${name}-desktop'..."
     local app_json
     app_json=$(coolify_api POST "applications/private-github-app" "{
         \"project_uuid\": \"${COOLIFY_PROJECT_UUID}\",
@@ -456,7 +456,7 @@ cmd_spawn() {
     # -------------------------------------------------------------------------
     # Step 2: Set pre_deployment_command (creates host bind mount dir)
     # -------------------------------------------------------------------------
-    log "[2/6] Setting host bind mount + compose location..."
+    log "[2/7] Setting host bind mount + compose location..."
     coolify_api PATCH "applications/${app_uuid}" "{
         \"docker_compose_location\": \"/docker-compose.agent.yml\",
         \"pre_deployment_command\": \"mkdir -p /opt/m2o/${name}/home && chown -R 1000:1000 /opt/m2o/${name}/home\"
@@ -465,7 +465,7 @@ cmd_spawn() {
     # -------------------------------------------------------------------------
     # Step 3: Set environment variables
     # -------------------------------------------------------------------------
-    log "[3/6] Setting environment variables..."
+    log "[3/7] Setting environment variables..."
 
     # Fleet-wide vars (from config file)
     for kv in "${fleet_env[@]}"; do
@@ -475,6 +475,7 @@ cmd_spawn() {
 
     # Agent-specific vars (always set, override fleet defaults)
     coolify_set_env "${app_uuid}" "AGENT_NAME"               "${name}"
+    coolify_set_env "${app_uuid}" "AGENT_ID"                 "${name}"
     coolify_set_env "${app_uuid}" "M2_HOME"                  "/agent_home"
     coolify_set_env "${app_uuid}" "AGENT_TELEGRAM_BOT_TOKEN" "${telegram_token}"
     coolify_set_env "${app_uuid}" "COLLECTION_NAME"          "agent_memory_${name}"
@@ -487,9 +488,103 @@ cmd_spawn() {
     log "  Env vars set"
 
     # -------------------------------------------------------------------------
+    # Step 4a: Create Qdrant memory namespace
+    # -------------------------------------------------------------------------
+    log "[4a/7] Creating Qdrant collection 'agent_memory_${name}'..."
+    local qdrant_url="${QDRANT_URL:-http://memory-qdrant:6333}"
+    # Read from fleet-env.conf if available
+    [[ " ${fleet_env[*]} " =~ QDRANT_URL=([^ ]*) ]] && qdrant_url="${BASH_REMATCH[1]}"
+    local qdrant_result
+    qdrant_result=$(curl -sf -o /dev/null -w "%{http_code}" -X PUT \
+        "${qdrant_url}/collections/agent_memory_${name}" \
+        -H "Content-Type: application/json" \
+        -d '{
+            "vectors": {"size": 1024, "distance": "Cosine"},
+            "optimizers_config": {"default_segment_number": 2}
+        }') 2>/dev/null || true
+    if [ "$qdrant_result" = "200" ] || [ "$qdrant_result" = "201" ]; then
+        log "  Collection created: agent_memory_${name}"
+        # Add payload indices
+        for field in "timestamp:float" "importance:float" "agent_id:keyword" "tier:keyword" "entity_tags:keyword" "memory_type:keyword"; do
+            fname="${field%%:*}"; ftype="${field##*:}"
+            curl -sf -X PUT "${qdrant_url}/collections/agent_memory_${name}/index" \
+                -H "Content-Type: application/json" \
+                -d "{\"field_name\":\"${fname}\",\"field_schema\":\"${ftype}\"}" > /dev/null 2>&1 || true
+        done
+        log "  Payload indices created"
+    else
+        log "  Warning: Qdrant returned ${qdrant_result} — collection may already exist or Qdrant unreachable"
+    fi
+
+    # -------------------------------------------------------------------------
+    # Step 4b: Create Planka user
+    # -------------------------------------------------------------------------
+    log "[4b/7] Creating Planka user for '${name}'..."
+    local planka_url="${PLANKA_URL:-https://kanban.machinemachine.ai}"
+    local planka_token="${PLANKA_TOKEN:-}"
+    local planka_email="${name}@machinemachine.ai"
+    local planka_pass="${name^}Agent2026!"
+    for kv in "${fleet_env[@]}"; do
+        [[ "$kv" == PLANKA_URL=* ]]   && planka_url="${kv#*=}"
+        [[ "$kv" == PLANKA_TOKEN=* ]] && planka_token="${kv#*=}"
+    done
+    if [ -n "${planka_token}" ]; then
+        local planka_create
+        planka_create=$(curl -sf -X POST "${planka_url}/api/users" \
+            -H "Content-Type: application/json" \
+            -H "Authorization: Bearer ${planka_token}" \
+            -d "{\"email\":\"${planka_email}\",\"password\":\"${planka_pass}\",\"name\":\"${name^}\",\"username\":\"${name}\"}" \
+            2>/dev/null | python3 -c "import json,sys; d=json.load(sys.stdin); print(d.get('item',{}).get('id','err:'+str(d)))" 2>/dev/null || echo "failed")
+        if [[ "${planka_create}" =~ ^[0-9]+ ]]; then
+            log "  Planka user created: ${planka_email} (id: ${planka_create})"
+            # Terms acceptance via DB exec
+            local pg_container
+            pg_container=$(sudo curl -sf --unix-socket /var/run/docker.sock \
+                "http://localhost/containers/json" 2>/dev/null | \
+                python3 -c "
+import json,sys
+cs=json.load(sys.stdin)
+for c in cs:
+    if any('postgres' in n.lower() and 'planka' in n.lower() for n in c.get('Names',[])):
+        print(c['Id'][:12])
+        break
+" 2>/dev/null || echo "")
+            if [ -n "${pg_container}" ]; then
+                EXEC_ID=$(sudo curl -sf -X POST --unix-socket /var/run/docker.sock \
+                    "http://localhost/containers/${pg_container}/exec" \
+                    -H "Content-Type: application/json" \
+                    -d "{\"Cmd\":[\"psql\",\"-U\",\"postgres\",\"planka\",\"-c\",\"UPDATE \\\"user\\\" SET is_agreement_accepted=true WHERE username='${name}'\"],\"AttachStdout\":true,\"AttachStderr\":true}" \
+                    2>/dev/null | python3 -c "import json,sys; print(json.load(sys.stdin).get('Id',''))")
+                [ -n "${EXEC_ID}" ] && sudo curl -sf -X POST --unix-socket /var/run/docker.sock \
+                    "http://localhost/exec/${EXEC_ID}/start" \
+                    -H "Content-Type: application/json" -d '{"Detach":false}' > /dev/null 2>&1
+                log "  Terms accepted via DB exec"
+            fi
+            # Get individual token
+            local agent_token
+            agent_token=$(curl -sf -X POST "${planka_url}/api/access-tokens" \
+                -H "Content-Type: application/json" \
+                -d "{\"emailOrUsername\":\"${planka_email}\",\"password\":\"${planka_pass}\"}" \
+                2>/dev/null | python3 -c "import json,sys; print(json.load(sys.stdin).get('item',''))" 2>/dev/null || echo "")
+            [ -n "${agent_token}" ] && {
+                coolify_set_env "${app_uuid}" "PLANKA_EMAIL" "${planka_email}"
+                coolify_set_env "${app_uuid}" "PLANKA_USER"  "${planka_email}"
+                coolify_set_env "${app_uuid}" "PLANKA_PASS"  "${planka_pass}"
+                coolify_set_env "${app_uuid}" "PLANKA_TOKEN" "${agent_token}"
+                log "  Individual Planka token set in Coolify"
+            } || log "  Warning: Could not get individual token — shared admin token will be used"
+        else
+            log "  Warning: Planka user creation failed (${planka_create}). Using shared admin token."
+            coolify_set_env "${app_uuid}" "PLANKA_EMAIL" "${planka_email}"
+        fi
+    else
+        log "  Skipping Planka user — no PLANKA_TOKEN in fleet env"
+    fi
+
+    # -------------------------------------------------------------------------
     # Step 4: Pre-register Guacamole connection
     # -------------------------------------------------------------------------
-    log "[4/6] Pre-registering Guacamole connection..."
+    log "[5/7] Pre-registering Guacamole connection (m2o)..."
     load_guacamole_creds 2>/dev/null && {
         local guac_token
         guac_token=$(guacamole_token 2>/dev/null) && {
@@ -521,7 +616,7 @@ cmd_spawn() {
     # -------------------------------------------------------------------------
     # Step 5: Update registry
     # -------------------------------------------------------------------------
-    log "[5/6] Registering in fleet registry..."
+    log "[6/7] Registering in fleet registry..."
     local ts
     ts=$(date -u +%Y-%m-%d)
     cat >> "${REGISTRY_FILE}" << YAML
@@ -540,7 +635,7 @@ YAML
     # Step 6: Deploy (unless --no-deploy)
     # -------------------------------------------------------------------------
     if [ "${no_deploy}" = "false" ]; then
-        log "[6/6] Triggering deployment..."
+        log "[7/7] Triggering deployment..."
         coolify_api POST "deploy?uuid=${app_uuid}&force=false" > /dev/null
         log "  Deployment triggered"
         log ""
@@ -550,7 +645,7 @@ YAML
         log "   Guacamole:    m2o.machinemachine.ai → '${name^} Desktop'"
         log "   Timeline:     ~3 min to first Telegram message"
     else
-        log "[6/6] Skipping deploy (--no-deploy). Run when ready:"
+        log "[7/7] Skipping deploy (--no-deploy). Run when ready:"
         log "  coolify_api POST deploy?uuid=${app_uuid}&force=false"
     fi
 
