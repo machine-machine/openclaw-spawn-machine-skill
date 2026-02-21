@@ -253,8 +253,8 @@ cmd_validate() {
         ((fail++))
     fi
 
-    printf "  %-40s" "guacd port (4822)..."
-    if nc -z -w 2 "${container}" 4822 &>/dev/null; then
+    printf "  %-40s" "OpenClaw gateway (18789)..."
+    if bash -c "</dev/tcp/${container}/18789" 2>/dev/null; then
         echo "PASS"
         ((pass++))
     else
@@ -300,10 +300,10 @@ cmd_status() {
         printf "  %-15s" "${name}"
 
         if ping -c 1 -W 1 "${container}" &>/dev/null; then
-            if nc -z -w 1 "${container}" 4822 &>/dev/null; then
+            if bash -c "</dev/tcp/${container}/18789" 2>/dev/null; then
                 echo "OPERATIONAL  ${container}"
             else
-                echo "UNHEALTHY    ${container}  (guacd not responding)"
+                echo "UNHEALTHY    ${container}  (gateway not responding on 18789)"
             fi
         else
             echo "UNREACHABLE  ${container}"
@@ -487,11 +487,11 @@ services:
       - /opt/m2o/${name}/home:/agent_home
 
     healthcheck:
-      test: [\"CMD-SHELL\", \"nc -z localhost 4822 || exit 1\"]
+      test: [\"CMD-SHELL\", \"bash -c '</dev/tcp/localhost/18789' 2>/dev/null && exit 0 || exit 1\"]
       interval: 30s
       timeout: 10s
       retries: 3
-      start_period: 90s
+      start_period: 120s
 
     networks:
       default:
