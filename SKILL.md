@@ -118,6 +118,52 @@ After completing, store the deployment record:
 
 ## WORKFLOW EXECUTION
 
+### Phase 0: Pre-Spawn Discovery (AUTO — runs before Step 1)
+
+Before asking the operator a single question, mine existing context to build a warm-start package.
+This eliminates redundant questions and lets the new agent arrive already knowing its operator.
+
+**Step 00 — Memory Sweep**
+Search vector memory for any prior discussions about this agent or domain:
+```bash
+~/.openclaw/skills/m2-memory/memory.sh search "{agent concept or domain}" --limit 10
+~/.openclaw/skills/m2-memory/memory.sh search "spawn agent" --limit 5
+~/.openclaw/skills/m2-memory/memory.sh entities "spawn-machine,incubator" --limit 5
+```
+Collect: operator preferences, past decisions, mentioned agent names, stated purposes.
+
+**Step 01 — Operator Profile Assembly**
+Pull the operator's known context from memory and conversation history:
+- Communication style, timezone, active projects
+- Preferred tools, language, response style
+- Current pain points and goals
+If the operator is the same as m2's (Mariusz), pre-fill from USER.md.
+
+**Step 02 — Domain Context Gathering**
+For the agent's specialization area, collect:
+- Relevant Planka cards (`planka-pm.sh context "{domain}"`)
+- Existing skills that overlap with the new agent's purpose
+- Infrastructure dependencies (which shared services will it need?)
+
+**Step 03 — Bootstrap Memory Synthesis**
+Compile everything into `platform/incubator/{name}/bootstrap-memory.jsonl`:
+```jsonl
+{"role": "system", "content": "Operator prefers minimal communication, CET timezone", "importance": 0.9, "type": "semantic"}
+{"role": "system", "content": "Active project: {X}. Current status: {Y}", "importance": 0.8, "type": "semantic"}
+{"role": "system", "content": "Operator's communication style: direct, technical, no fluff", "importance": 0.85, "type": "semantic"}
+```
+This file gets ingested into the new agent's Qdrant namespace on first boot,
+giving it Day 1 context without having to re-learn everything from scratch.
+
+**Phase 0 outputs:**
+- `platform/incubator/{name}/bootstrap-memory.jsonl` — warm-start memory payload
+- Pre-filled agent profile (reduces Step 1 questions)
+- Service recommendations based on domain analysis
+
+**Transition:** Phase 0 feeds directly into Step 1. Questions already answered by discovery are skipped.
+
+---
+
 ### Step 1: Define Agent (ASK — Telegram Buttons + Text)
 
 Gather agent basics through conversation. Ask 1-2 questions at a time.
@@ -428,6 +474,51 @@ message({
 
 ---
 
+### Step 8: First Contact (AUTO — ~60s after validation)
+
+The final step: the new agent introduces itself to the operator with warm context from Phase 0.
+
+1. **Read bootstrap memory** (AUTO):
+   ```bash
+   cat platform/incubator/{name}/bootstrap-memory.jsonl
+   ```
+   Extract: operator's active projects, key context, the agent's purpose.
+
+2. **Compose intro message** (AUTO):
+   Build a warm intro that proves the agent already knows its operator:
+   ```
+   Format: "[AgentName] online. I know you're working on [X]. My first suggestion: [Y based on context]."
+   ```
+   - `[X]` = operator's current top project/priority from bootstrap memory
+   - `[Y]` = a concrete, actionable suggestion relevant to the agent's specialization
+
+3. **Send via OpenClaw** (AUTO):
+   ```bash
+   openclaw message send --to {operator_telegram_id} --text "{intro_message}"
+   ```
+
+4. **Store deployment record** (AUTO):
+   ```bash
+   ~/.openclaw/skills/m2-memory/memory.sh store \
+     "Spawned agent {name}: {purpose}. First contact sent to operator. Status: OPERATIONAL." \
+     --importance 0.9 \
+     --entities "spawn-machine,deployment,agent:{name},first-contact"
+   ```
+
+5. **Report completion**:
+```
+message({
+  message: "**{name} has made first contact.**\n\nIntro sent to operator via Telegram.\nThe agent is live, warm-started, and ready.\n\nPhase 0 discovery → Phase 1 deployment → Phase 2 first contact: COMPLETE.",
+  buttons: [
+    [
+      { text: "Done", callback_data: "spawn_first_contact_done" }
+    ]
+  ]
+})
+```
+
+---
+
 ## CALLBACK DATA CONVENTIONS
 
 All callbacks prefixed with `spawn_` for clean routing:
@@ -443,6 +534,7 @@ All callbacks prefixed with `spawn_` for clean routing:
 | `spawn_continue_*` | 5-7 | Progress flow |
 | `spawn_complete` | 7 | Workflow done |
 | `spawn_fix_*` | 7 | Issue remediation |
+| `spawn_first_contact_*` | 8 | First contact actions |
 
 ## ERROR HANDLING
 
@@ -468,8 +560,8 @@ message({
 Track progress using the agent-spec.md frontmatter:
 
 ```yaml
-stepsCompleted: [1, 2, 3]
-status: SERVICES_SELECTED  # DEFINING → IDENTITY_CREATED → SERVICES_SELECTED → CONFIGURED → DEPLOYED → REGISTERED → OPERATIONAL
+stepsCompleted: [0, 1, 2, 3]
+status: SERVICES_SELECTED  # DISCOVERY → DEFINING → IDENTITY_CREATED → SERVICES_SELECTED → CONFIGURED → DEPLOYED → REGISTERED → OPERATIONAL → FIRST_CONTACT
 currentStep: 4
 ```
 
