@@ -797,6 +797,209 @@ PYEOF
 }
 
 # =============================================================================
+# =============================================================================
+# cmd_destroy — full teardown of a spawned agent
+# =============================================================================
+cmd_destroy() {
+    local name="${1:-}"
+    local force=false
+    shift || true
+    [[ "${1:-}" == "--force" ]] && force=true
+
+    [ -z "${name}" ] && { err "Usage: spawn-machine.sh destroy <name> [--force]"; exit 1; }
+
+    # Load fleet env
+    local fleet_env=()
+    if [ -f "${FLEET_ENV_CONF}" ]; then
+        while IFS='=' read -r k v; do
+            [[ "$k" =~ ^#.*$ || -z "$k" ]] && continue
+            fleet_env+=("$k=$v")
+        done < "${FLEET_ENV_CONF}"
+    fi
+
+    # Get values from fleet_env
+    get_fleet_var() { local key="$1" val=""
+        for kv in "${fleet_env[@]}"; do [[ "${kv%%=*}" == "$key" ]] && val="${kv#*=}"; done; echo "$val"; }
+
+    # Read agent from registry
+    if ! grep -q "^  ${name}:" "${REGISTRY_FILE}" 2>/dev/null; then
+        err "Agent '${name}' not found in registry. Check: spawn-machine.sh list"
+        exit 1
+    fi
+    local coolify_uuid memory_collection
+    coolify_uuid=$(python3 -c "
+import sys
+with open('${REGISTRY_FILE}') as f: content=f.read()
+import re
+m=re.search(r'  ${name}:\n((?:    .+\n)*)', content)
+if m:
+    block=m.group(1)
+    u=re.search(r'coolify_uuid:\s*(\S+)', block)
+    print(u.group(1) if u else '')
+" 2>/dev/null || echo "")
+    memory_collection="agent_memory_${name}"
+
+    log "Destroying agent '${name}' (coolify_uuid=${coolify_uuid:-unknown})"
+
+    # Confirmation
+    if [ "${force}" = "false" ]; then
+        echo ""
+        echo "  ⚠️  This will permanently delete:"
+        echo "     • Coolify app (container + named volume ${name}_agent_home)"
+        echo "     • Qdrant collection ${memory_collection}"
+        echo "     • Planka user ${name}"
+        echo "     • Guacamole connection '${name^} Desktop'"
+        echo "     • S3 data s3://m2o-agents/${name}/"
+        echo "     • Registry entry + GitHub incubator files"
+        echo ""
+        read -rp "  Type '${name}' to confirm: " confirm
+        [ "${confirm}" != "${name}" ] && { log "Aborted."; exit 0; }
+    fi
+
+    local errors=0
+
+    # ── 1. Coolify: stop + delete application ────────────────────────────────
+    log "[1/7] Deleting Coolify application..."
+    if [ -n "${coolify_uuid}" ]; then
+        local del_result
+        del_result=$(coolify_api DELETE "applications/${coolify_uuid}" 2>&1) && \
+            log "  Coolify app deleted" || \
+            { log "  Warning: Coolify delete failed: ${del_result}"; ((errors++)); }
+    else
+        log "  Warning: No coolify_uuid in registry — skipping Coolify delete"
+        ((errors++))
+    fi
+
+    # ── 2. Qdrant: delete collection ─────────────────────────────────────────
+    log "[2/7] Deleting Qdrant collection '${memory_collection}'..."
+    local qdrant_url="${QDRANT_URL:-http://memory-qdrant:6333}"
+    for kv in "${fleet_env[@]}"; do [[ "${kv%%=*}" == "QDRANT_URL" ]] && qdrant_url="${kv#*=}"; done
+    curl -sf -X DELETE "${qdrant_url}/collections/${memory_collection}" -o /dev/null && \
+        log "  Qdrant collection deleted" || \
+        { log "  Warning: Qdrant delete failed (collection may not exist)"; }
+
+    # ── 3. Planka: delete user ────────────────────────────────────────────────
+    log "[3/7] Deleting Planka user '${name}'..."
+    local planka_url planka_token planka_email
+    planka_url=$(get_fleet_var "PLANKA_URL"); planka_url="${planka_url:-${PLANKA_URL:-}}"
+    planka_token=$(get_fleet_var "PLANKA_TOKEN"); planka_token="${planka_token:-${PLANKA_TOKEN:-}}"
+    planka_email="${name}@m2o.machinemachine.ai"
+    if [ -n "${planka_url}" ] && [ -n "${planka_token}" ]; then
+        local user_id
+        user_id=$(curl -sf -H "Authorization: Bearer ${planka_token}" \
+            "${planka_url}/api/users" | \
+            python3 -c "
+import json,sys
+users=json.load(sys.stdin).get('items',[])
+match=[u for u in users if u.get('email','')=='${planka_email}' or u.get('username','')=='${name}']
+print(match[0]['id'] if match else '')
+" 2>/dev/null || echo "")
+        if [ -n "${user_id}" ]; then
+            curl -sf -X DELETE -H "Authorization: Bearer ${planka_token}" \
+                "${planka_url}/api/users/${user_id}" -o /dev/null && \
+                log "  Planka user deleted (id=${user_id})" || \
+                { log "  Warning: Planka user delete failed"; ((errors++)); }
+        else
+            log "  Planka user '${name}' not found — skipping"
+        fi
+    else
+        log "  Planka not configured — skipping"
+    fi
+
+    # ── 4. Guacamole: delete connection ───────────────────────────────────────
+    log "[4/7] Removing Guacamole connection..."
+    load_guacamole_creds 2>/dev/null && {
+        local guac_token
+        guac_token=$(guacamole_token 2>/dev/null) && {
+            local conn_id
+            conn_id=$(curl -sf \
+                "${GUACAMOLE_URL}/api/session/data/mysql/connections?token=${guac_token}" | \
+                python3 -c "
+import json,sys
+conns=json.load(sys.stdin)
+match=[v for v in conns.values() if v.get('name','').lower()=='${name} desktop' or v.get('name','').lower()=='${name^} desktop']
+print(match[0]['identifier'] if match else '')
+" 2>/dev/null || echo "")
+            if [ -n "${conn_id}" ]; then
+                curl -sf -X DELETE \
+                    "${GUACAMOLE_URL}/api/session/data/mysql/connections/${conn_id}?token=${guac_token}" \
+                    -o /dev/null && \
+                    log "  Guacamole connection deleted (id=${conn_id})" || \
+                    { log "  Warning: Guacamole delete failed"; ((errors++)); }
+            else
+                log "  Guacamole connection '${name^} Desktop' not found — skipping"
+            fi
+        }
+    } || log "  Guacamole creds not found — skipping"
+
+    # ── 5. S3: purge agent prefix ─────────────────────────────────────────────
+    log "[5/7] Purging S3 data s3://m2o-agents/${name}/..."
+    local minio_container="minio-e44c04co80oss0wgwkc4g4ok"
+    local minio_access minio_secret minio_bucket
+    minio_access=$(get_fleet_var "MINIO_ACCESS_KEY"); minio_secret=$(get_fleet_var "MINIO_SECRET_KEY")
+    minio_bucket=$(get_fleet_var "MINIO_BUCKET"); minio_bucket="${minio_bucket:-m2o-agents}"
+    if [ -n "${minio_access}" ] && [ -n "${minio_secret}" ]; then
+        local EXEC_ID RESULT
+        EXEC_ID=$(sudo curl -s --unix-socket /var/run/docker.sock \
+            -X POST "http://localhost/containers/${minio_container}/exec" \
+            -H "Content-Type: application/json" \
+            -d "{\"Cmd\":[\"sh\",\"-c\",\"mc alias set local http://localhost:9000 ${minio_access} ${minio_secret} 2>/dev/null && mc rm --recursive --force local/${minio_bucket}/${name}/ 2>&1 && echo OK || echo FAIL\"],\"AttachStdout\":true,\"AttachStderr\":true}" | \
+            python3 -c "import json,sys; print(json.load(sys.stdin).get('Id',''))" 2>/dev/null || echo "")
+        if [ -n "$EXEC_ID" ]; then
+            RESULT=$(sudo curl -s --unix-socket /var/run/docker.sock \
+                -X POST "http://localhost/exec/${EXEC_ID}/start" \
+                -H "Content-Type: application/json" -d '{"Detach":false}' | strings)
+            [[ "$RESULT" == *"OK"* ]] && log "  S3 data purged" || log "  Warning: S3 purge result: ${RESULT}"
+        else
+            log "  Warning: Could not exec into Minio container"
+            ((errors++))
+        fi
+    else
+        log "  Minio not configured — skipping S3 purge"
+    fi
+
+    # ── 6. Registry: remove agent entry ──────────────────────────────────────
+    log "[6/7] Removing from registry.yaml..."
+    python3 - << PYEOF
+import re, sys
+with open('${REGISTRY_FILE}') as f:
+    content = f.read()
+# Remove the agent block (name + all indented lines below it)
+pattern = r'(?m)^  ${name}:\n(?:    .+\n)*'
+new_content = re.sub(pattern, '', content)
+with open('${REGISTRY_FILE}', 'w') as f:
+    f.write(new_content)
+print('  Registry entry removed')
+PYEOF
+
+    # ── 7. GitHub: delete incubator files ────────────────────────────────────
+    log "[7/7] Removing GitHub incubator files..."
+    local repo="machine-machine/m2-desktop"
+    for filepath in "incubator/${name}/docker-compose.yml" \
+                    "incubator/${name}/AGENTS.md" \
+                    "incubator/${name}/IDENTITY.md" \
+                    "incubator/${name}/SOUL.md" \
+                    "incubator/${name}/MEMORY.md" \
+                    "incubator/${name}/USER.md"; do
+        local sha
+        sha=$(gh api "repos/${repo}/contents/${filepath}?ref=base" --jq '.sha' 2>/dev/null || echo "")
+        [ -z "$sha" ] && continue
+        gh api --method DELETE "repos/${repo}/contents/${filepath}" \
+            --field message="destroy: remove ${name} incubator files" \
+            --field sha="${sha}" \
+            --field branch="base" -q '.commit.sha' > /dev/null 2>&1 && \
+            log "  Deleted ${filepath}" || log "  Warning: Could not delete ${filepath}"
+    done
+
+    # ── Summary ───────────────────────────────────────────────────────────────
+    echo ""
+    if [ "${errors}" -eq 0 ]; then
+        log "✅ Agent '${name}' fully destroyed — all resources cleaned up"
+    else
+        log "⚠️  Agent '${name}' destroyed with ${errors} warning(s) — check log above"
+    fi
+}
+
 # Main
 # =============================================================================
 COMMAND="${1:-help}"
@@ -824,6 +1027,10 @@ case "${COMMAND}" in
         require_agent_name "${1:-}"
         cmd_validate "$1"
         ;;
+    destroy)
+        require_agent_name "${1:-}"
+        cmd_destroy "$@"
+        ;;
     status)
         cmd_status "${1:-}"
         ;;
@@ -842,6 +1049,7 @@ case "${COMMAND}" in
         echo "    --cerebras-key KEY          Per-agent Cerebras key"
         echo "    --skills LIST               Override default AGENT_SKILLS"
         echo "    --no-deploy                 Configure but don't deploy yet"
+        echo "  destroy <name> [--force]  Fully decommission an agent (7 cleanup steps)"
         echo "  init <name>       Create incubator directory + agent spec"
         echo "  configure <name>  Generate env vars from agent spec"
         echo "  register <name>   Register agent in Guacamole"
