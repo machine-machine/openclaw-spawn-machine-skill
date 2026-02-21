@@ -484,7 +484,7 @@ services:
     privileged: true
 
     volumes:
-      - /opt/m2o/${name}/home:/agent_home
+      - ${name}_agent_home:/agent_home
 
     healthcheck:
       test: [\"CMD-SHELL\", \"bash -c '</dev/tcp/localhost/18789' 2>/dev/null && exit 0 || exit 1\"]
@@ -503,6 +503,10 @@ services:
 networks:
   coolify:
     external: true
+
+volumes:
+  ${name}_agent_home:
+    driver: local
 "
 
     # Push compose to GitHub
@@ -557,15 +561,12 @@ PYEOF
     log "  Created: ${app_uuid}"
 
     # -------------------------------------------------------------------------
-    # Step 3: Set pre_deployment_command (creates host bind mount dir)
+    # Step 3: (named volumes auto-created by Docker — no host mkdir needed)
     # -------------------------------------------------------------------------
-    log "[3/9] Setting pre_deployment_command for host bind mount..."
-    coolify_api PATCH "applications/${app_uuid}" "{
-        \"pre_deployment_command\": \"mkdir -p /opt/m2o/${name}/home && chown -R 1000:1000 /opt/m2o/${name}/home\"
-    }" > /dev/null
+    log "[3/9] Named volume '${name}_agent_home' will be auto-created by Docker"
 
     # -------------------------------------------------------------------------
-    # Step 3: Set environment variables
+    # Step 4: Set environment variables
     # -------------------------------------------------------------------------
     log "[4/9] Setting environment variables..."
 
@@ -586,6 +587,17 @@ PYEOF
     [ -n "${openrouter_key}" ] && coolify_set_env "${app_uuid}" "OPENROUTER_API_KEY"  "${openrouter_key}"
     [ -n "${cerebras_key}" ]   && coolify_set_env "${app_uuid}" "CEREBRAS_API_KEY"    "${cerebras_key}"
     [ -n "${custom_skills}" ]  && coolify_set_env "${app_uuid}" "AGENT_SKILLS"        "${custom_skills}"
+
+    # S3/Minio env vars (inherit from environment or fleet-env.conf)
+    local minio_endpoint="${MINIO_ENDPOINT:-}"
+    local minio_access="${MINIO_ACCESS_KEY:-}"
+    local minio_secret="${MINIO_SECRET_KEY:-}"
+    if [ -n "$minio_endpoint" ]; then
+        coolify_set_env "${app_uuid}" "MINIO_ENDPOINT"    "${minio_endpoint}"
+        coolify_set_env "${app_uuid}" "MINIO_ACCESS_KEY"  "${minio_access}"
+        coolify_set_env "${app_uuid}" "MINIO_SECRET_KEY"  "${minio_secret}"
+        coolify_set_env "${app_uuid}" "MINIO_BUCKET"      "${MINIO_BUCKET:-m2o-agents}"
+    fi
 
     log "  Env vars set"
 
