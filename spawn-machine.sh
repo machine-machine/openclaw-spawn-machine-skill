@@ -431,9 +431,112 @@ cmd_spawn() {
     fi
 
     # -------------------------------------------------------------------------
-    # Step 1: Create Coolify app
+    # Step 1: Generate per-agent compose + push to GitHub
     # -------------------------------------------------------------------------
-    log "[1/7] Creating Coolify application '${name}-desktop'..."
+    log "[1/9] Generating per-agent compose → machine-machine/m2-desktop:base/incubator/${name}/"
+    local compose_content
+    compose_content="# Agent compose — ${name} — all values hardcoded, no \${VAR} outside environment section
+services:
+  agent-desktop-worker:
+    container_name: ${name}-desktop
+    image: ghcr.io/machine-machine/m2-desktop:agent-latest
+    restart: unless-stopped
+
+    environment:
+      AGENT_NAME: \"${name}\"
+      AGENT_ID: \"${name}\"
+      M2_HOME: /agent_home
+      WORKSPACE: /home/developer/.openclaw/workspace
+      ANTHROPIC_API_KEY: \${ANTHROPIC_API_KEY}
+      OPENROUTER_API_KEY: \${OPENROUTER_API_KEY}
+      CEREBRAS_API_KEY: \${CEREBRAS_API_KEY}
+      AGENT_TELEGRAM_BOT_TOKEN: \${AGENT_TELEGRAM_BOT_TOKEN}
+      AGENT_OPENCLAW_REPO: \${AGENT_OPENCLAW_REPO}
+      AGENT_OPENCLAW_BRANCH: \${AGENT_OPENCLAW_BRANCH}
+      AGENT_BOOTSTRAP_REPO_URL: \${AGENT_BOOTSTRAP_REPO_URL}
+      AGENT_TTS_BASE_URL: \${AGENT_TTS_BASE_URL}
+      AGENT_TTS_VOICE: \${AGENT_TTS_VOICE}
+      AGENT_TTS_TIMEOUT_MS: \${AGENT_TTS_TIMEOUT_MS}
+      AGENT_STT_BASE_URL: \${AGENT_STT_BASE_URL}
+      AGENT_STT_MODEL: \${AGENT_STT_MODEL}
+      QDRANT_URL: \${QDRANT_URL}
+      EMBEDDINGS_URL: \${EMBEDDINGS_URL}
+      COLLECTION_NAME: \"agent_memory_${name}\"
+      AGENT_SKILLS: \${AGENT_SKILLS}
+      BGE_PROXY_TOKEN: \${BGE_PROXY_TOKEN}
+      PLANKA_URL: \${PLANKA_URL}
+      PLANKA_TOKEN: \${PLANKA_TOKEN}
+      PLANKA_USER: \${PLANKA_USER}
+      PLANKA_EMAIL: \${PLANKA_EMAIL}
+      PLANKA_PASS: \${PLANKA_PASS}
+      COOLIFY_TOKEN: \${COOLIFY_TOKEN}
+      COOLIFY_API_URL: \${COOLIFY_API_URL}
+      VNC_PASSWORD: \${VNC_PASSWORD}
+      AGENT_BROWSER_ENABLED: \"true\"
+
+    deploy:
+      resources:
+        limits:
+          cpus: \"8\"
+          memory: 8g
+
+    shm_size: 1gb
+    privileged: true
+
+    volumes:
+      - /opt/m2o/${name}/home:/agent_home
+
+    healthcheck:
+      test: [\"CMD-SHELL\", \"ss -tlnp | grep 4822 || exit 1\"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 90s
+
+    networks:
+      default:
+      coolify:
+        aliases:
+          - ${name}-desktop
+          - ${name}-m2o
+
+networks:
+  coolify:
+    external: true
+"
+
+    # Push compose to GitHub
+    python3 - << PYEOF
+import json, base64, subprocess, sys
+
+content = base64.b64encode("""${compose_content}""".encode()).decode()
+repo = "machine-machine/m2-desktop"
+path = "incubator/${name}/docker-compose.yml"
+branch = "base"
+
+# Get existing SHA if any
+r = subprocess.run(["gh","api",f"repos/{repo}/contents/{path}?ref={branch}"],
+    capture_output=True, text=True)
+sha = json.loads(r.stdout).get("sha","") if r.returncode == 0 else ""
+
+payload = {"message": "spawn: ${name} compose — hardcoded volume + GHCR image",
+           "content": content, "branch": branch}
+if sha: payload["sha"] = sha
+
+r2 = subprocess.run(["gh","api","--method=PUT",f"repos/{repo}/contents/{path}","--input=-"],
+    input=json.dumps(payload), capture_output=True, text=True)
+if r2.returncode == 0:
+    print("  Pushed: incubator/${name}/docker-compose.yml")
+else:
+    print(f"  ERROR: {r2.stderr[:100]}", file=sys.stderr)
+    sys.exit(1)
+PYEOF
+    log "  Compose pushed to GitHub"
+
+    # -------------------------------------------------------------------------
+    # Step 2: Create Coolify app
+    # -------------------------------------------------------------------------
+    log "[2/9] Creating Coolify application '${name}-desktop'..."
     local app_json
     app_json=$(coolify_api POST "applications/private-github-app" "{
         \"project_uuid\": \"${COOLIFY_PROJECT_UUID}\",
@@ -442,7 +545,7 @@ cmd_spawn() {
         \"git_repository\": \"machine-machine/m2-desktop\",
         \"git_branch\": \"base\",
         \"build_pack\": \"dockercompose\",
-        \"docker_compose_location\": \"/docker-compose.agent.yml\",
+        \"docker_compose_location\": \"/incubator/${name}/docker-compose.yml\",
         \"github_app_uuid\": \"${COOLIFY_GITHUB_APP_UUID}\",
         \"ports_exposes\": \"8080\",
         \"name\": \"${name}-desktop\",
@@ -454,18 +557,17 @@ cmd_spawn() {
     log "  Created: ${app_uuid}"
 
     # -------------------------------------------------------------------------
-    # Step 2: Set pre_deployment_command (creates host bind mount dir)
+    # Step 3: Set pre_deployment_command (creates host bind mount dir)
     # -------------------------------------------------------------------------
-    log "[2/7] Setting host bind mount + compose location..."
+    log "[3/9] Setting pre_deployment_command for host bind mount..."
     coolify_api PATCH "applications/${app_uuid}" "{
-        \"docker_compose_location\": \"/docker-compose.agent.yml\",
         \"pre_deployment_command\": \"mkdir -p /opt/m2o/${name}/home && chown -R 1000:1000 /opt/m2o/${name}/home\"
     }" > /dev/null
 
     # -------------------------------------------------------------------------
     # Step 3: Set environment variables
     # -------------------------------------------------------------------------
-    log "[3/7] Setting environment variables..."
+    log "[4/9] Setting environment variables..."
 
     # Fleet-wide vars (from config file)
     for kv in "${fleet_env[@]}"; do
@@ -490,7 +592,7 @@ cmd_spawn() {
     # -------------------------------------------------------------------------
     # Step 4a: Create Qdrant memory namespace
     # -------------------------------------------------------------------------
-    log "[4a/7] Creating Qdrant collection 'agent_memory_${name}'..."
+    log "[5/9] Creating Qdrant collection 'agent_memory_${name}'..."
     local qdrant_url="${QDRANT_URL:-http://memory-qdrant:6333}"
     # Read from fleet-env.conf if available
     [[ " ${fleet_env[*]} " =~ QDRANT_URL=([^ ]*) ]] && qdrant_url="${BASH_REMATCH[1]}"
@@ -519,7 +621,7 @@ cmd_spawn() {
     # -------------------------------------------------------------------------
     # Step 4b: Create Planka user
     # -------------------------------------------------------------------------
-    log "[4b/7] Creating Planka user for '${name}'..."
+    log "[6/9] Creating Planka user for '${name}'..."
     local planka_url="${PLANKA_URL:-https://kanban.machinemachine.ai}"
     local planka_token="${PLANKA_TOKEN:-}"
     local planka_email="${name}@machinemachine.ai"
@@ -584,7 +686,7 @@ for c in cs:
     # -------------------------------------------------------------------------
     # Step 4: Pre-register Guacamole connection
     # -------------------------------------------------------------------------
-    log "[5/7] Pre-registering Guacamole connection (m2o)..."
+    log "[7/9] Pre-registering Guacamole connection (m2o)..."
     load_guacamole_creds 2>/dev/null && {
         local guac_token
         guac_token=$(guacamole_token 2>/dev/null) && {
@@ -616,7 +718,7 @@ for c in cs:
     # -------------------------------------------------------------------------
     # Step 5: Update registry
     # -------------------------------------------------------------------------
-    log "[6/7] Registering in fleet registry..."
+    log "[8/9] Registering in fleet registry..."
     local ts
     ts=$(date -u +%Y-%m-%d)
     cat >> "${REGISTRY_FILE}" << YAML
@@ -635,7 +737,7 @@ YAML
     # Step 6: Deploy (unless --no-deploy)
     # -------------------------------------------------------------------------
     if [ "${no_deploy}" = "false" ]; then
-        log "[7/7] Triggering deployment..."
+        log "[9/9] Triggering deployment..."
         coolify_api POST "deploy?uuid=${app_uuid}&force=false" > /dev/null
         log "  Deployment triggered"
         log ""
@@ -645,7 +747,7 @@ YAML
         log "   Guacamole:    m2o.machinemachine.ai → '${name^} Desktop'"
         log "   Timeline:     ~3 min to first Telegram message"
     else
-        log "[7/7] Skipping deploy (--no-deploy). Run when ready:"
+        log "[9/9] Skipping deploy (--no-deploy). Run when ready:"
         log "  coolify_api POST deploy?uuid=${app_uuid}&force=false"
     fi
 
