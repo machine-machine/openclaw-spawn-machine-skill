@@ -369,9 +369,30 @@ coolify_api() {
 
 coolify_set_env() {
     local uuid="$1" key="$2" value="$3"
-    coolify_api POST "applications/${uuid}/envs" \
-        "{\"key\":\"${key}\",\"value\":$(echo -n "${value}" | python3 -c 'import json,sys; print(json.dumps(sys.stdin.read()))'),\"is_preview\":false}" \
-        > /dev/null 2>&1
+    local json_val
+    json_val=$(echo -n "${value}" | python3 -c 'import json,sys; print(json.dumps(sys.stdin.read()))')
+    # POST first; if 409 (exists), DELETE then re-POST
+    local out code
+    out=$(curl -s -w '\n%{http_code}' -X POST "${COOLIFY_API}/applications/${uuid}/envs" \
+        -H "Authorization: Bearer $(coolify_token)" \
+        -H "Content-Type: application/json" \
+        -d "{\"key\":\"${key}\",\"value\":${json_val},\"is_preview\":false}")
+    code=$(echo "${out}" | tail -1)
+    if [ "${code}" = "409" ]; then
+        # Already exists — get its uuid and overwrite
+        local env_uuid
+        env_uuid=$(coolify_api GET "applications/${uuid}/envs" 2>/dev/null | \
+            python3 -c "import json,sys,os; envs=json.load(sys.stdin); e=[x for x in envs if x.get('key')=='${key}']; print(e[0]['uuid'] if e else '')" 2>/dev/null || echo "")
+        if [ -n "${env_uuid}" ]; then
+            curl -s -X DELETE "${COOLIFY_API}/applications/${uuid}/envs/${env_uuid}" \
+                -H "Authorization: Bearer $(coolify_token)" > /dev/null 2>&1 || true
+            curl -s -X POST "${COOLIFY_API}/applications/${uuid}/envs" \
+                -H "Authorization: Bearer $(coolify_token)" \
+                -H "Content-Type: application/json" \
+                -d "{\"key\":\"${key}\",\"value\":${json_val},\"is_preview\":false}" > /dev/null 2>&1 || true
+        fi
+    fi
+    return 0
 }
 
 # =============================================================================
