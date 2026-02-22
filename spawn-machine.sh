@@ -495,6 +495,9 @@ services:
       COOLIFY_API_URL: \${COOLIFY_API_URL}
       VNC_PASSWORD: \${VNC_PASSWORD}
       AGENT_BROWSER_ENABLED: \"true\"
+      FLEET_REDIS_HOST: \"fleet-redis\"
+      FLEET_REDIS_PORT: \"6379\"
+      AGENT_PRESET: \"generalist\"
 
     deploy:
       resources:
