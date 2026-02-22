@@ -639,10 +639,18 @@ PYEOF
     [ -n "${session_id}" ] && coolify_set_env "${app_uuid}" "AGENT_NOTIFY_URL" \
         "https://api.machinemachine.ai/v1/onboard/notify-live"
 
-    [ -n "${anthropic_key}" ]  && coolify_set_env "${app_uuid}" "ANTHROPIC_API_KEY"   "${anthropic_key}"
-    [ -n "${openrouter_key}" ] && coolify_set_env "${app_uuid}" "OPENROUTER_API_KEY"  "${openrouter_key}"
+    # API keys — use project-level shared vars by default (Coolify {{project.KEY}} pattern)
+    # Override with explicit --anthropic-key / --openrouter-key flags if needed
+    local effective_anthropic="${anthropic_key:-{{project.ANTHROPIC_API_KEY}}}"
+    local effective_openrouter="${openrouter_key:-{{project.OPENROUTER_API_KEY}}}"
+    coolify_set_env "${app_uuid}" "ANTHROPIC_API_KEY"   "${effective_anthropic}"
+    coolify_set_env "${app_uuid}" "OPENROUTER_API_KEY"  "${effective_openrouter}"
     [ -n "${cerebras_key}" ]   && coolify_set_env "${app_uuid}" "CEREBRAS_API_KEY"    "${cerebras_key}"
     [ -n "${custom_skills}" ]  && coolify_set_env "${app_uuid}" "AGENT_SKILLS"        "${custom_skills}"
+
+    # Default model: GLM-5 via OpenRouter (override with AGENT_DEFAULT_MODEL env or --model flag)
+    local default_model="${AGENT_DEFAULT_MODEL:-openrouter/thudm/glm-z1-32b:free}"
+    coolify_set_env "${app_uuid}" "AGENT_DEFAULT_MODEL" "${default_model}"
 
     # S3/Minio env vars — read from shell env first, fall back to fleet-env.conf
     local minio_endpoint="${MINIO_ENDPOINT:-}"
