@@ -758,12 +758,17 @@ for c in cs:
     # -------------------------------------------------------------------------
     # Step 4: Pre-register Guacamole connection
     # -------------------------------------------------------------------------
-    log "[7/9] Pre-registering Guacamole connection (m2o)..."
+    log "[7/9] Pre-registering Guacamole connection + user (m2o)..."
     load_guacamole_creds 2>/dev/null && {
         local guac_token
         guac_token=$(guacamole_token 2>/dev/null) && {
             local vnc_pass="agentdesktop"
-            local response
+            # Generate a per-agent Guacamole password (stored in registry)
+            local guac_user_pass
+            guac_user_pass=$(python3 -c "import secrets; print(secrets.token_urlsafe(16))")
+
+            # Create VNC connection — hostname matches container alias (${name}-m2o)
+            local response conn_id
             response=$(curl -sf -X POST \
                 "${GUACAMOLE_URL}/api/session/data/mysql/connections?token=${guac_token}" \
                 -H "Content-Type: application/json" \
@@ -772,7 +777,7 @@ for c in cs:
                     \"protocol\": \"vnc\",
                     \"parentIdentifier\": \"ROOT\",
                     \"parameters\": {
-                        \"hostname\": \"${name}-desktop\",
+                        \"hostname\": \"${name}-m2o\",
                         \"port\": \"5900\",
                         \"password\": \"${vnc_pass}\",
                         \"color-depth\": \"32\",
@@ -781,9 +786,41 @@ for c in cs:
                     },
                     \"attributes\": {}
                 }")
-            local conn_id
             conn_id=$(echo "${response}" | python3 -c "import json,sys; print(json.load(sys.stdin).get('identifier',''))" 2>/dev/null || true)
-            [ -n "${conn_id}" ] && log "  Guacamole connection ID: ${conn_id}" || log "  Warning: Guacamole pre-registration failed (agent will register on first boot)"
+            [ -n "${conn_id}" ] && log "  Connection created: ID ${conn_id}" || log "  Warning: connection pre-registration failed"
+
+            # Create a per-agent Guacamole user
+            local user_response
+            user_response=$(curl -sf -X POST \
+                "${GUACAMOLE_URL}/api/session/data/mysql/users?token=${guac_token}" \
+                -H "Content-Type: application/json" \
+                -d "{
+                    \"username\": \"${name}\",
+                    \"password\": \"${guac_user_pass}\",
+                    \"attributes\": {
+                        \"disabled\": \"\",
+                        \"expired\": \"\",
+                        \"access-window-start\": \"\",
+                        \"access-window-end\": \"\",
+                        \"valid-from\": \"\",
+                        \"valid-until\": \"\",
+                        \"timezone\": null
+                    }
+                }" 2>/dev/null || echo "")
+            local user_created
+            user_created=$(echo "${user_response}" | python3 -c "import json,sys; print(json.load(sys.stdin).get('username',''))" 2>/dev/null || true)
+
+            # Grant that user access to their connection
+            if [ -n "${user_created}" ] && [ -n "${conn_id}" ]; then
+                curl -sf -X PATCH \
+                    "${GUACAMOLE_URL}/api/session/data/mysql/users/${name}/permissions?token=${guac_token}" \
+                    -H "Content-Type: application/json" \
+                    -d "[{\"op\":\"add\",\"path\":\"/connectionPermissions/${conn_id}\",\"value\":\"READ\"}]" > /dev/null 2>&1 || true
+                log "  Guacamole user '${name}' created — password: ${guac_user_pass}"
+                log "  URL: ${GUACAMOLE_URL} | User: ${name} | Pass: ${guac_user_pass}"
+            else
+                log "  Warning: Guacamole user creation failed — admin access only"
+            fi
         }
     } || log "  Guacamole creds not found — skipping pre-registration"
 
