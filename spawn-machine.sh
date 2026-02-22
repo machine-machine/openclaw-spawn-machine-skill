@@ -416,7 +416,7 @@ cmd_spawn() {
     shift 2 || true
 
     # Parse options
-    local anthropic_key="" openrouter_key="" cerebras_key="" custom_skills="" no_deploy=false
+    local anthropic_key="" openrouter_key="" cerebras_key="" custom_skills="" no_deploy=false session_id=""
     while [[ $# -gt 0 ]]; do
         case "$1" in
             --anthropic-key)  anthropic_key="$2";  shift 2 ;;
@@ -424,6 +424,7 @@ cmd_spawn() {
             --cerebras-key)   cerebras_key="$2";   shift 2 ;;
             --skills)         custom_skills="$2";  shift 2 ;;
             --no-deploy)      no_deploy=true;      shift ;;
+            --session-id)     session_id="$2";     shift 2 ;;
             *) err "Unknown option: $1"; exit 1 ;;
         esac
     done
@@ -630,6 +631,10 @@ PYEOF
     coolify_set_env "${app_uuid}" "M2_HOME"                  "/agent_home"
     coolify_set_env "${app_uuid}" "AGENT_TELEGRAM_BOT_TOKEN" "${telegram_token}"
     coolify_set_env "${app_uuid}" "COLLECTION_NAME"          "agent_memory_${name}"
+    # Notify-live wiring — agent calls this on boot to mark itself live
+    [ -n "${session_id}" ] && coolify_set_env "${app_uuid}" "AGENT_SESSION_ID" "${session_id}"
+    [ -n "${session_id}" ] && coolify_set_env "${app_uuid}" "AGENT_NOTIFY_URL" \
+        "https://api.machinemachine.ai/v1/onboard/notify-live"
 
     [ -n "${anthropic_key}" ]  && coolify_set_env "${app_uuid}" "ANTHROPIC_API_KEY"   "${anthropic_key}"
     [ -n "${openrouter_key}" ] && coolify_set_env "${app_uuid}" "OPENROUTER_API_KEY"  "${openrouter_key}"
@@ -818,6 +823,16 @@ for c in cs:
                     -d "[{\"op\":\"add\",\"path\":\"/connectionPermissions/${conn_id}\",\"value\":\"READ\"}]" > /dev/null 2>&1 || true
                 log "  Guacamole user '${name}' created — password: ${guac_user_pass}"
                 log "  URL: ${GUACAMOLE_URL} | User: ${name} | Pass: ${guac_user_pass}"
+                # Store creds in onboarding session so notify-live can send them to the user
+                if [ -n "${session_id}" ] && [ -n "${ONBOARD_API_URL:-}" ] && [ -n "${ONBOARD_ADMIN_TOKEN:-}" ]; then
+                    curl -sf -X POST "${ONBOARD_API_URL}/v1/admin/set-guac-creds" \
+                        -H "Content-Type: application/json" \
+                        -H "x-admin-token: ${ONBOARD_ADMIN_TOKEN}" \
+                        -d "{\"session_id\":\"${session_id}\",\"guacamole_user\":\"${name}\",\"guacamole_pass\":\"${guac_user_pass}\"}" \
+                        > /dev/null 2>&1 \
+                        && log "  Guacamole creds stored in onboarding session ${session_id}" \
+                        || log "  Warning: could not store guac creds in session (non-fatal)"
+                fi
             else
                 log "  Warning: Guacamole user creation failed — admin access only"
             fi
