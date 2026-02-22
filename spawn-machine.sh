@@ -462,6 +462,8 @@ services:
   ${name}-m2o:
     container_name: ${name}-m2o
     image: ghcr.io/machine-machine/m2-desktop:agent-latest
+    # Fix old image: strip set -e + auto-strip meta block from generated openclaw.json
+    entrypoint: ["/bin/bash", "-c", "sed -i '/^set -e/d' /usr/local/bin/entrypoint.sh; echo 'const _f=require(\"fs\"),_p=require(\"os\").homedir()+\"/.openclaw/openclaw.json\";try{const _d=JSON.parse(_f.readFileSync(_p));delete _d.meta;_f.writeFileSync(_p,JSON.stringify(_d,null,2))}catch(_e){}' >> /usr/local/bin/generate-openclaw-config.js; exec /usr/local/bin/entrypoint.sh"]
     restart: unless-stopped
 
     environment:
