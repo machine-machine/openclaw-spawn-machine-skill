@@ -38,7 +38,11 @@ user decisions and auto-execute infrastructure commands where safe.
 
 Before creating ANY Coolify app, confirm with the operator:
 1. ✅ Telegram bot token (from @BotFather) — ask FIRST, not after deploy
-2. ✅ LLM API key (Anthropic/OpenAI/other) — must exist before deploy
+2. ✅ LLM API key — auto-inherited from Coolify project level (no per-agent key needed)
+   - `OPENROUTER_API_KEY = {{project.OPENROUTER_API_KEY}}` is set automatically for all spawns
+   - `ANTHROPIC_API_KEY = {{project.ANTHROPIC_API_KEY}}` likewise (if set at project level)
+   - Default model: `openrouter/thudm/glm-z1-32b:free` via `AGENT_DEFAULT_MODEL`
+   - Override: pass `--openrouter-key sk-or-...` or `--anthropic-key sk-ant-...` to spawn-machine.sh
 3. ✅ Agent branch pushed to GitHub with identity files
 4. ✅ AGENT_CONFIG_GENERATE=true in env vars
 
@@ -62,6 +66,11 @@ except redeploying. Don't deploy warm bodies.
 - **Coolify API**: Use `/applications/private-github-app` to create git-backed apps
 - **Network**: Coolify external network for cross-service DNS
 - **Shared services**: Qdrant (memory), BGE-M3 (embeddings), Speaches (STT), Qwen3-TTS (TTS)
+- **Shared API keys (Coolify project level)**: Set once → available to ALL agents automatically
+  - Pattern: `{{project.KEY_NAME}}` in any app's env var value
+  - Set at: Coolify → machine.machine project → gear icon → Environment Variables
+  - Currently set: `OPENROUTER_API_KEY` (all spawns inherit this automatically)
+  - To wire an existing agent: `curl -X POST .../applications/{uuid}/envs -d '{"key":"OPENROUTER_API_KEY","value":"{{project.OPENROUTER_API_KEY}}"}'`
 - **Guacamole**: Running on m2's desktop stack at g2.machinemachine.ai — register new agents as VNC connections there (no separate Guacamole per agent)
 - **Incubator (local)**: `platform/incubator/{agent-name}/` — working copy for identity files before pushing to branch
 - **CLI**: `~/.openclaw/skills/spawn-machine/spawn-machine.sh`
