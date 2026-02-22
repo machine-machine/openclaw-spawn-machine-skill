@@ -194,7 +194,7 @@ cmd_register() {
 
     log "Creating VNC connection for '${name}'..."
     local response
-    response=$(curl -s -X POST "${GUACAMOLE_URL}/api/session/data/mysql/connections?token=${token}" \
+    response=$(curl -s -X POST "${GUACAMOLE_URL}/api/session/data/postgresql/connections?token=${token}" \
         -H "Content-Type: application/json" \
         -d "{
             \"name\": \"${name^} Desktop\",
@@ -788,7 +788,7 @@ for c in cs:
             # Create VNC connection — hostname matches container alias (${name}-m2o)
             local response conn_id
             response=$(curl -sf -X POST \
-                "${GUACAMOLE_URL}/api/session/data/mysql/connections?token=${guac_token}" \
+                "${GUACAMOLE_URL}/api/session/data/postgresql/connections?token=${guac_token}" \
                 -H "Content-Type: application/json" \
                 -d "{
                     \"name\": \"${name^} Desktop\",
@@ -810,7 +810,7 @@ for c in cs:
             # Create a per-agent Guacamole user
             local user_response
             user_response=$(curl -sf -X POST \
-                "${GUACAMOLE_URL}/api/session/data/mysql/users?token=${guac_token}" \
+                "${GUACAMOLE_URL}/api/session/data/postgresql/users?token=${guac_token}" \
                 -H "Content-Type: application/json" \
                 -d "{
                     \"username\": \"${name}\",
@@ -831,7 +831,7 @@ for c in cs:
             # Grant that user access to their connection
             if [ -n "${user_created}" ] && [ -n "${conn_id}" ]; then
                 curl -sf -X PATCH \
-                    "${GUACAMOLE_URL}/api/session/data/mysql/users/${name}/permissions?token=${guac_token}" \
+                    "${GUACAMOLE_URL}/api/session/data/postgresql/users/${name}/permissions?token=${guac_token}" \
                     -H "Content-Type: application/json" \
                     -d "[{\"op\":\"add\",\"path\":\"/connectionPermissions/${conn_id}\",\"value\":\"READ\"}]" > /dev/null 2>&1 || true
                 log "  Guacamole user '${name}' created — password: ${guac_user_pass}"
@@ -1027,7 +1027,7 @@ print(match[0]['id'] if match else '')
         guac_token=$(guacamole_token 2>/dev/null) && {
             local conn_id
             conn_id=$(curl -sf \
-                "${GUACAMOLE_URL}/api/session/data/mysql/connections?token=${guac_token}" | \
+                "${GUACAMOLE_URL}/api/session/data/postgresql/connections?token=${guac_token}" | \
                 python3 -c "
 import json,sys
 conns=json.load(sys.stdin)
@@ -1036,7 +1036,7 @@ print(match[0]['identifier'] if match else '')
 " 2>/dev/null || echo "")
             if [ -n "${conn_id}" ]; then
                 curl -sf -X DELETE \
-                    "${GUACAMOLE_URL}/api/session/data/mysql/connections/${conn_id}?token=${guac_token}" \
+                    "${GUACAMOLE_URL}/api/session/data/postgresql/connections/${conn_id}?token=${guac_token}" \
                     -o /dev/null && \
                     log "  Guacamole connection deleted (id=${conn_id})" || \
                     { log "  Warning: Guacamole connection delete failed"; ((errors++)); }
@@ -1045,7 +1045,7 @@ print(match[0]['identifier'] if match else '')
             fi
             # Delete the per-agent Guacamole user
             curl -sf -X DELETE \
-                "${GUACAMOLE_URL}/api/session/data/mysql/users/${name}?token=${guac_token}" \
+                "${GUACAMOLE_URL}/api/session/data/postgresql/users/${name}?token=${guac_token}" \
                 -o /dev/null 2>&1 && \
                 log "  Guacamole user '${name}' deleted" || \
                 log "  Guacamole user '${name}' not found or already removed (non-fatal)"
