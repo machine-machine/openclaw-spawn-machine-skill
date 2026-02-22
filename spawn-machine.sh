@@ -948,9 +948,10 @@ if m:
         echo "     • Coolify app (container + named volume ${name}_agent_home)"
         echo "     • Qdrant collection ${memory_collection}"
         echo "     • Planka user ${name}"
-        echo "     • Guacamole connection '${name^} Desktop'"
+        echo "     • Guacamole connection '${name^} Desktop' + user '${name}'"
         echo "     • S3 data s3://m2o-agents/${name}/"
-        echo "     • Registry entry + GitHub incubator files"
+        echo "     • Registry entry + GitHub branch agents/${name}"
+        echo "     • Onboarding session (marked destroyed in API)"
         echo ""
         read -rp "  Type '${name}' to confirm: " confirm
         [ "${confirm}" != "${name}" ] && { log "Aborted."; exit 0; }
@@ -1007,7 +1008,7 @@ print(match[0]['id'] if match else '')
     fi
 
     # ── 4. Guacamole: delete connection ───────────────────────────────────────
-    log "[4/7] Removing Guacamole connection..."
+    log "[4/8] Removing Guacamole connection + user..."
     load_guacamole_creds 2>/dev/null && {
         local guac_token
         guac_token=$(guacamole_token 2>/dev/null) && {
@@ -1025,15 +1026,21 @@ print(match[0]['identifier'] if match else '')
                     "${GUACAMOLE_URL}/api/session/data/mysql/connections/${conn_id}?token=${guac_token}" \
                     -o /dev/null && \
                     log "  Guacamole connection deleted (id=${conn_id})" || \
-                    { log "  Warning: Guacamole delete failed"; ((errors++)); }
+                    { log "  Warning: Guacamole connection delete failed"; ((errors++)); }
             else
                 log "  Guacamole connection '${name^} Desktop' not found — skipping"
             fi
+            # Delete the per-agent Guacamole user
+            curl -sf -X DELETE \
+                "${GUACAMOLE_URL}/api/session/data/mysql/users/${name}?token=${guac_token}" \
+                -o /dev/null 2>&1 && \
+                log "  Guacamole user '${name}' deleted" || \
+                log "  Guacamole user '${name}' not found or already removed (non-fatal)"
         }
     } || log "  Guacamole creds not found — skipping"
 
     # ── 5. S3: purge agent prefix ─────────────────────────────────────────────
-    log "[5/7] Purging S3 data s3://m2o-agents/${name}/..."
+    log "[5/8] Purging S3 data s3://m2o-agents/${name}/..."
     local minio_container="minio-e44c04co80oss0wgwkc4g4ok"
     local minio_access minio_secret minio_bucket
     minio_access=$(get_fleet_var "MINIO_ACCESS_KEY"); minio_secret=$(get_fleet_var "MINIO_SECRET_KEY")
@@ -1059,7 +1066,7 @@ print(match[0]['identifier'] if match else '')
     fi
 
     # ── 6. Registry: remove agent entry ──────────────────────────────────────
-    log "[6/7] Removing from registry.yaml..."
+    log "[6/8] Removing from registry.yaml..."
     python3 - << PYEOF
 import re, sys
 with open('${REGISTRY_FILE}') as f:
@@ -1073,13 +1080,31 @@ print('  Registry entry removed')
 PYEOF
 
     # ── 7. GitHub: delete per-agent branch ────────────────────────────────────
-    log "[7/7] Deleting GitHub branch agents/${name}..."
+    log "[7/8] Deleting GitHub branch agents/${name}..."
     local repo="machine-machine/m2-desktop"
     if gh api "repos/${repo}/git/refs/heads/agents/${name}" &>/dev/null; then
         gh api --method DELETE "repos/${repo}/git/refs/heads/agents/${name}" > /dev/null 2>&1 && \
             log "  Deleted branch agents/${name}" || { log "  Warning: could not delete branch"; ((errors++)); }
     else
         log "  Branch agents/${name} not found — skipping"
+    fi
+
+    # ── 8. Onboarding session: mark destroyed ────────────────────────────────
+    log "[8/8] Marking onboarding session destroyed..."
+    local onboard_api onboard_admin_token
+    onboard_api=$(get_fleet_var "ONBOARD_API_URL"); onboard_api="${onboard_api:-https://api.machinemachine.ai}"
+    onboard_admin_token=$(get_fleet_var "ONBOARD_ADMIN_TOKEN")
+    if [ -n "${onboard_admin_token}" ]; then
+        HTTP=$(curl -sf -X POST "${onboard_api}/v1/admin/mark-destroyed" \
+            -H "Content-Type: application/json" \
+            -H "x-admin-token: ${onboard_admin_token}" \
+            -d "{\"agent_name\":\"${name}\"}" \
+            -w "%{http_code}" -o /dev/null 2>/dev/null)
+        [ "${HTTP}" = "200" ] && \
+            log "  Onboarding session marked destroyed" || \
+            log "  Onboarding session not found or already cleaned (HTTP ${HTTP}) — non-fatal"
+    else
+        log "  ONBOARD_ADMIN_TOKEN not set — skipping session cleanup"
     fi
 
     # ── Summary ───────────────────────────────────────────────────────────────
