@@ -433,12 +433,12 @@ cmd_spawn() {
     # -------------------------------------------------------------------------
     # Step 1: Generate per-agent compose + push to GitHub
     # -------------------------------------------------------------------------
-    log "[1/9] Generating per-agent compose → machine-machine/m2-desktop:base/incubator/${name}/"
+    log "[1/9] Generating per-agent compose → machine-machine/m2-desktop:agents/${name}/docker-compose.yml"
     local compose_content
     compose_content="# Agent compose — ${name} — all values hardcoded, no \${VAR} outside environment section
 services:
-  ${name}-desktop:
-    container_name: ${name}-desktop
+  ${name}-m2o:
+    container_name: ${name}-m2o
     image: ghcr.io/machine-machine/m2-desktop:agent-latest
     restart: unless-stopped
 
@@ -497,7 +497,6 @@ services:
       default:
       coolify:
         aliases:
-          - ${name}-desktop
           - ${name}-m2o
 
 networks:
@@ -509,55 +508,83 @@ volumes:
     driver: local
 "
 
-    # Push compose to GitHub
+    # Push compose to GitHub on a per-agent branch (agents/${name})
+    # Rationale: all agents sharing :base means ANY push to base triggers redeploys
+    # for every agent connected to that branch. Per-agent branch = isolated webhook.
     python3 - << PYEOF
 import json, base64, subprocess, sys
 
 content = base64.b64encode("""${compose_content}""".encode()).decode()
-repo = "machine-machine/m2-desktop"
-path = "incubator/${name}/docker-compose.yml"
-branch = "base"
+repo    = "machine-machine/m2-desktop"
+path    = "docker-compose.yml"   # root of the per-agent branch
+branch  = "agents/${name}"
 
-# Get existing SHA if any
-r = subprocess.run(["gh","api",f"repos/{repo}/contents/{path}?ref={branch}"],
+# Get SHA of base branch tip to fork from
+base_ref = subprocess.run(
+    ["gh","api",f"repos/{repo}/git/refs/heads/base"],
+    capture_output=True, text=True)
+if base_ref.returncode != 0:
+    print(f"  ERROR: could not read base branch: {base_ref.stderr[:100]}", file=sys.stderr)
+    sys.exit(1)
+base_sha = json.loads(base_ref.stdout)["object"]["sha"]
+
+# Create per-agent branch from base (ignore 422 = already exists)
+branch_payload = {"ref": f"refs/heads/{branch}", "sha": base_sha}
+br = subprocess.run(
+    ["gh","api","--method=POST",f"repos/{repo}/git/refs","--input=-"],
+    input=json.dumps(branch_payload), capture_output=True, text=True)
+if br.returncode == 0:
+    print(f"  Created branch agents/${name} from base ({base_sha[:8]})")
+elif "Reference already exists" in br.stderr or "already exists" in br.stderr:
+    print(f"  Branch agents/${name} already exists — reusing")
+else:
+    print(f"  ERROR creating branch: {br.stderr[:100]}", file=sys.stderr)
+    sys.exit(1)
+
+# Get existing SHA of docker-compose.yml on agent branch (for update)
+r = subprocess.run(
+    ["gh","api",f"repos/{repo}/contents/{path}?ref={branch}"],
     capture_output=True, text=True)
 sha = json.loads(r.stdout).get("sha","") if r.returncode == 0 else ""
 
-payload = {"message": "spawn: ${name} compose — hardcoded volume + GHCR image",
+payload = {"message": "spawn: ${name} docker-compose.yml — service name ${name}-m2o",
            "content": content, "branch": branch}
-if sha: payload["sha"] = sha
+if sha:
+    payload["sha"] = sha
 
-r2 = subprocess.run(["gh","api","--method=PUT",f"repos/{repo}/contents/{path}","--input=-"],
+r2 = subprocess.run(
+    ["gh","api","--method=PUT",f"repos/{repo}/contents/{path}","--input=-"],
     input=json.dumps(payload), capture_output=True, text=True)
 if r2.returncode == 0:
-    print("  Pushed: incubator/${name}/docker-compose.yml")
+    print(f"  Pushed: {branch}/docker-compose.yml")
 else:
     print(f"  ERROR: {r2.stderr[:100]}", file=sys.stderr)
     sys.exit(1)
 PYEOF
-    log "  Compose pushed to GitHub"
+    log "  Compose pushed to GitHub (branch: agents/${name})"
 
     # -------------------------------------------------------------------------
-    # Step 2: Create Coolify app
+    # Step 2: Create Coolify app on per-agent branch
     # -------------------------------------------------------------------------
-    log "[2/9] Creating Coolify application '${name}-desktop'..."
+    log "[2/9] Creating Coolify application '${name}-m2o'..."
     local app_json
     app_json=$(coolify_api POST "applications/private-github-app" "{
         \"project_uuid\": \"${COOLIFY_PROJECT_UUID}\",
         \"server_uuid\": \"${COOLIFY_SERVER_UUID}\",
         \"environment_name\": \"production\",
         \"git_repository\": \"machine-machine/m2-desktop\",
-        \"git_branch\": \"base\",
+        \"git_branch\": \"agents/${name}\",
         \"build_pack\": \"dockercompose\",
-        \"docker_compose_location\": \"/incubator/${name}/docker-compose.yml\",
+        \"docker_compose_location\": \"/docker-compose.yml\",
         \"github_app_uuid\": \"${COOLIFY_GITHUB_APP_UUID}\",
         \"ports_exposes\": \"8080\",
-        \"name\": \"${name}-desktop\",
+        \"name\": \"${name}-m2o\",
         \"instant_deploy\": false
     }") || { err "Failed to create Coolify app"; exit 1; }
 
     local app_uuid
-    app_uuid=$(echo "${app_json}" | python3 -c "import json,sys; print(json.load(sys.stdin)['uuid'])")
+    app_uuid=$(echo "${app_json}" | python3 -c "import json,sys; d=json.load(sys.stdin); print(d.get('uuid') or d.get('data',{}).get('uuid',''))" 2>/dev/null)
+    [ -z "${app_uuid}" ] && { err "Could not parse app UUID from: ${app_json}"; exit 1; }
     log "  Created: ${app_uuid}"
 
     # -------------------------------------------------------------------------
@@ -972,24 +999,15 @@ with open('${REGISTRY_FILE}', 'w') as f:
 print('  Registry entry removed')
 PYEOF
 
-    # ── 7. GitHub: delete incubator files ────────────────────────────────────
-    log "[7/7] Removing GitHub incubator files..."
+    # ── 7. GitHub: delete per-agent branch ────────────────────────────────────
+    log "[7/7] Deleting GitHub branch agents/${name}..."
     local repo="machine-machine/m2-desktop"
-    for filepath in "incubator/${name}/docker-compose.yml" \
-                    "incubator/${name}/AGENTS.md" \
-                    "incubator/${name}/IDENTITY.md" \
-                    "incubator/${name}/SOUL.md" \
-                    "incubator/${name}/MEMORY.md" \
-                    "incubator/${name}/USER.md"; do
-        local sha
-        sha=$(gh api "repos/${repo}/contents/${filepath}?ref=base" --jq '.sha' 2>/dev/null || echo "")
-        [ -z "$sha" ] && continue
-        gh api --method DELETE "repos/${repo}/contents/${filepath}" \
-            --field message="destroy: remove ${name} incubator files" \
-            --field sha="${sha}" \
-            --field branch="base" -q '.commit.sha' > /dev/null 2>&1 && \
-            log "  Deleted ${filepath}" || log "  Warning: Could not delete ${filepath}"
-    done
+    if gh api "repos/${repo}/git/refs/heads/agents/${name}" &>/dev/null; then
+        gh api --method DELETE "repos/${repo}/git/refs/heads/agents/${name}" > /dev/null 2>&1 && \
+            log "  Deleted branch agents/${name}" || { log "  Warning: could not delete branch"; ((errors++)); }
+    else
+        log "  Branch agents/${name} not found — skipping"
+    fi
 
     # ── Summary ───────────────────────────────────────────────────────────────
     echo ""
