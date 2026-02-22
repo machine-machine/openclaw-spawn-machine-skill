@@ -430,7 +430,7 @@ cmd_spawn() {
     done
 
     [ -z "${name}" ]           && { err "Usage: spawn-machine.sh spawn <name> <telegram_token>"; exit 1; }
-    [ -z "${telegram_token}" ] && { err "Telegram token required"; exit 1; }
+    [ -z "${telegram_token}" ] && echo "  ⚠️  No Telegram token — agent will run without Telegram channel"
 
     # Validate name not already in registry
     if grep -q "^  ${name}:" "${REGISTRY_FILE}" 2>/dev/null; then
@@ -632,7 +632,7 @@ PYEOF
     coolify_set_env "${app_uuid}" "AGENT_NAME"               "${name}"
     coolify_set_env "${app_uuid}" "AGENT_ID"                 "${name}"
     coolify_set_env "${app_uuid}" "M2_HOME"                  "/agent_home"
-    coolify_set_env "${app_uuid}" "AGENT_TELEGRAM_BOT_TOKEN" "${telegram_token}"
+    [ -n "${telegram_token}" ] && coolify_set_env "${app_uuid}" "AGENT_TELEGRAM_BOT_TOKEN" "${telegram_token}"
     coolify_set_env "${app_uuid}" "COLLECTION_NAME"          "agent_memory_${name}"
     # Notify-live wiring — agent calls this on boot to mark itself live
     [ -n "${session_id}" ] && coolify_set_env "${app_uuid}" "AGENT_SESSION_ID" "${session_id}"
@@ -1135,7 +1135,7 @@ shift || true
 case "${COMMAND}" in
     spawn)
         require_agent_name "${1:-}"
-        [ -z "${2:-}" ] && { err "Usage: spawn <name> <telegram_token>"; exit 1; }
+        true # telegram_token now optional
         cmd_spawn "$@"
         ;;
     init)
