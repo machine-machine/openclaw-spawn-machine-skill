@@ -462,8 +462,8 @@ services:
   ${name}-m2o:
     container_name: ${name}-m2o
     image: ghcr.io/machine-machine/m2-desktop:agent-latest
-    # Fix old image: strip set -e + auto-strip meta block from generated openclaw.json
-    entrypoint: [\"/bin/bash\", \"-c\", \"sed -i '/^set -e/d' /usr/local/bin/entrypoint.sh 2>/dev/null || true; exec /usr/local/bin/entrypoint.sh\"]
+    # Fix: strip set -e from entrypoint + strip meta block from generated openclaw.json (meta block breaks config validator)
+    entrypoint: [\"/bin/bash\", \"-c\", \"sed -i '/^set -e/d' /usr/local/bin/entrypoint.sh 2>/dev/null || true; echo aW1wb3J0IGpzb24scGF0aGxpYgpwPXBhdGhsaWIuUGF0aC5ob21lKCkvIi5vcGVuY2xhdy9vcGVuY2xhdy5qc29uIgppZiBwLmV4aXN0cygpOgogICAgZD1qc29uLmxvYWRzKHAucmVhZF90ZXh0KCkpCiAgICBkLnBvcCgibWV0YSIsTm9uZSkKICAgIHAud3JpdGVfdGV4dChqc29uLmR1bXBzKGQsaW5kZW50PTIpKQo= | base64 -d > /tmp/strip_meta.py; sed -i '/generate-openclaw-config/a python3 /tmp/strip_meta.py 2>/dev/null||true' /usr/local/bin/entrypoint.sh 2>/dev/null || true; exec /usr/local/bin/entrypoint.sh\"]
     restart: unless-stopped
 
     environment:
