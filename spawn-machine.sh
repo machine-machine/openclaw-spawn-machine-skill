@@ -499,6 +499,7 @@ services:
       AGENT_BROWSER_ENABLED: \"true\"
       FLEET_REDIS_HOST: \"fleet-redis\"
       FLEET_REDIS_PORT: \"6379\"
+      FLEET_SSH_PUBKEY: \${FLEET_SSH_PUBKEY}
       AGENT_PRESET: \"generalist\"
 
     deploy:
